@@ -6,6 +6,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 public class DataGenerator {
@@ -47,97 +48,125 @@ public class DataGenerator {
     };
 
     public static void main(String[] args) {
-        ColumnSchema city = new StringColumnSchema("city", 20, true);
-        ColumnSchema state = new StringColumnSchema("state", 2, true);
-        ColumnSchema latitude = new IntColumnSchema("latitude", true);
-        ColumnSchema longitude = new IntColumnSchema("longitude" , false);
-
-        List<ColumnSchema> columns = new ArrayList<>(List.of(city, state, latitude, longitude));
-
-        TableSchema tableSchema = new TableSchema(columns, "cities");
         try {
-            generateSchemaFile(tableSchema, "city_data");
-            generateShardAndIndexFiles(tableSchema, "city_data", 10, 1000);
+            generateCityData("city_data", "cities", 10, 1000, System.nanoTime());
         } catch (Exception e) {
             System.out.println(e.getMessage());
         }
     }
 
-    private static void generateShardAndIndexFiles(TableSchema tableSchema, String dbName, int numShards, int rowsPerShard) throws Exception {
-        Random random = new Random();
+    public static TableSchema generateCityData(String dbName, String tableName, int numShards, int rowsPerShard, long seed) throws Exception {
+        TableSchema tableSchema = createCityTableSchema(tableName);
+        generateSchemaFile(tableSchema, dbName);
+        generateShardAndIndexFiles(tableSchema, dbName, numShards, rowsPerShard, seed);
+        return tableSchema;
+    }
 
+    public static TableSchema createCityTableSchema(String tableName) {
+        ColumnSchema city = new StringColumnSchema("city", 20, true);
+        ColumnSchema state = new StringColumnSchema("state", 2, true);
+        ColumnSchema latitude = new IntColumnSchema("latitude", true);
+        ColumnSchema longitude = new IntColumnSchema("longitude", false);
+
+        List<ColumnSchema> columns = new ArrayList<>(List.of(city, state, latitude, longitude));
+
+        return new TableSchema(columns, tableName);
+    }
+
+    public static void generateShardAndIndexFiles(TableSchema tableSchema, String dbName, int numShards, int rowsPerShard, long seed) throws Exception {
+        generateShardAndIndexFiles(tableSchema, dbName, numShards, rowsPerShard, new Random(seed));
+    }
+
+    private static void generateShardAndIndexFiles(TableSchema tableSchema, String dbName, int numShards, int rowsPerShard, Random random) throws Exception {
         for (int shardSuffix = 0; shardSuffix < numShards; shardSuffix++) {
             String shardPath = String.format(Constants.SHARD_LOC, dbName, tableSchema.getTableName(), shardSuffix);
             File shard = new File(shardPath);
+            ensureParentDirectoryExists(shard);
 
-            FileOutputStream shardStream = new FileOutputStream(shard);
             Map<ColumnSchema, Map<Object, List<Integer>>> columnIndexMap = new HashMap<>();
 
-            for (int rowIndex = 0; rowIndex < rowsPerShard; rowIndex++) {
-                Object[] randomCity = CITIES[random.nextInt(CITIES.length)];
+            try (FileOutputStream shardStream = new FileOutputStream(shard)) {
+                for (int rowIndex = 0; rowIndex < rowsPerShard; rowIndex++) {
+                    Object[] randomCity = CITIES[random.nextInt(CITIES.length)];
 
-                for (int colIndex = 0; colIndex < tableSchema.getColumns().size(); colIndex++) {
-                    ColumnSchema colSchema = tableSchema.getColumns().get(colIndex);
-                    Object val;
-                    if (colSchema.getColumnType() == ColumnSchema.COLUMN_TYPES.STRING_TYPE) {
-                        val = String.valueOf(randomCity[colIndex]);
-                        shardStream.write(ByteBuffer.allocate(colSchema.getNumBytes()).put(((String) val).getBytes()).array());
-                    } else if (colSchema.getColumnType() == ColumnSchema.COLUMN_TYPES.INT_TYPE) {
-                        val = randomCity[colIndex];
-                        shardStream.write(ByteBuffer.allocate(colSchema.getNumBytes()).putInt((Integer) val).array());
-                    } else {
-                        throw new Exception("Unknown column type");
+                    for (int colIndex = 0; colIndex < tableSchema.getColumns().size(); colIndex++) {
+                        ColumnSchema colSchema = tableSchema.getColumns().get(colIndex);
+                        Object val;
+                        if (colSchema.getColumnType() == ColumnSchema.COLUMN_TYPES.STRING_TYPE) {
+                            val = String.valueOf(randomCity[colIndex]);
+                            shardStream.write(toFixedStringBytes((String) val, colSchema.getNumBytes()));
+                        } else if (colSchema.getColumnType() == ColumnSchema.COLUMN_TYPES.INT_TYPE) {
+                            val = randomCity[colIndex];
+                            shardStream.write(ByteBuffer.allocate(colSchema.getNumBytes()).putInt((Integer) val).array());
+                        } else {
+                            throw new Exception("Unknown column type");
+                        }
+
+                        if (colSchema.isIndexed()) {
+                            columnIndexMap.computeIfAbsent(colSchema, ignored -> new HashMap<>())
+                                    .computeIfAbsent(val, ignored -> new ArrayList<>())
+                                    .add(rowIndex);
+                        }
                     }
-
-                    columnIndexMap.computeIfAbsent(colSchema, _ -> new HashMap<>())
-                            .computeIfAbsent(val, _ -> new ArrayList<>())
-                            .add(rowIndex);
                 }
             }
-
-            shardStream.close();
 
             for (ColumnSchema colSchema : columnIndexMap.keySet()) {
                 String shardColIndexPath = String.format(Constants.INDEX_FILE_LOC, dbName, tableSchema.getTableName(),
                         shardSuffix, colSchema.getColumnName());
                 File shardColIndex = new File(shardColIndexPath);
+                ensureParentDirectoryExists(shardColIndex);
 
-                FileOutputStream shardColIndexStream = new FileOutputStream(shardColIndex);
+                try (FileOutputStream shardColIndexStream = new FileOutputStream(shardColIndex)) {
+                    for (Object val : columnIndexMap.get(colSchema).keySet()) {
+                        if (colSchema.getColumnType() == ColumnSchema.COLUMN_TYPES.STRING_TYPE) {
+                            shardColIndexStream.write(toFixedStringBytes((String) val, colSchema.getNumBytes()));
+                        } else if (colSchema.getColumnType() == ColumnSchema.COLUMN_TYPES.INT_TYPE) {
+                            shardColIndexStream.write(ByteBuffer.allocate(colSchema.getNumBytes()).putInt((Integer) val).array());
+                        } else {
+                            throw new Exception("Unknown column type");
+                        }
 
-                for (Object val : columnIndexMap.get(colSchema).keySet()) {
-                    if (colSchema.getColumnType() == ColumnSchema.COLUMN_TYPES.STRING_TYPE) {
-                        shardColIndexStream.write(ByteBuffer.allocate(colSchema.getNumBytes()).put(((String) val).getBytes()).array());
-                    } else if (colSchema.getColumnType() == ColumnSchema.COLUMN_TYPES.INT_TYPE) {
-                        shardColIndexStream.write(ByteBuffer.allocate(colSchema.getNumBytes()).putInt((Integer) val).array());
-                    } else {
-                        throw new Exception("Unknown column type");
-                    }
+                        List<Integer> indexes = columnIndexMap.get(colSchema).get(val);
 
-                    List<Integer> indexes = columnIndexMap.get(colSchema).get(val);
+                        shardColIndexStream.write(ByteBuffer.allocate(4).putInt(indexes.size()).array());
 
-                    // write num indexes
-                    shardColIndexStream.write(ByteBuffer.allocate(4).putInt(indexes.size()).array());
-
-                    for (Integer index : indexes) {
-                        shardColIndexStream.write(ByteBuffer.allocate(4).putInt(index).array());
+                        for (Integer index : indexes) {
+                            shardColIndexStream.write(ByteBuffer.allocate(4).putInt(index).array());
+                        }
                     }
                 }
-
-                shardColIndexStream.close();
             }
         }
     }
 
-    private static void generateSchemaFile(TableSchema schema, String dbName) throws IOException {
+    public static void generateSchemaFile(TableSchema schema, String dbName) throws IOException {
         String schemaFilePath = String.format(Constants.SCHEMA_FILE_LOC, dbName, schema.getTableName());
         File schemaFile = new File(schemaFilePath);
+        ensureParentDirectoryExists(schemaFile);
 
-        FileOutputStream fos = new FileOutputStream(schemaFile);
+        try (FileOutputStream fos = new FileOutputStream(schemaFile)) {
+            Gson gson = new GsonBuilder()
+                    .registerTypeAdapter(ColumnSchema.class, new ColumnSchemaTypeAdapter())
+                    .create();
+            String schemaJson = gson.toJson(schema);
+            fos.write(schemaJson.getBytes(StandardCharsets.UTF_8));
+        }
+    }
 
-        Gson gson = new GsonBuilder()
-                .registerTypeAdapter(ColumnSchema.class, new ColumnSchemaTypeAdapter())
-                .create();
-        String schemaJson = gson.toJson(schema);
-        fos.write(schemaJson.getBytes());
+    private static byte[] toFixedStringBytes(String value, int numBytes) {
+        byte[] encoded = value.getBytes(StandardCharsets.UTF_8);
+        if (encoded.length > numBytes) {
+            throw new IllegalArgumentException("Value [" + value + "] requires " + encoded.length + " bytes but column allows " + numBytes);
+        }
+
+        return ByteBuffer.allocate(numBytes).put(encoded).array();
+    }
+
+    private static void ensureParentDirectoryExists(File file) throws IOException {
+        File parent = file.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IOException("Could not create directory: " + parent);
+        }
     }
 }

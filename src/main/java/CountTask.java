@@ -20,6 +20,8 @@ public class CountTask implements Callable<Integer> {
     private final int bytesPerRow;
 
     private final byte[] stringBytes;
+    private final byte[] queryValueBytes;
+    private final int queryValueAsInt;
 
     public CountTask(COLUMN_TYPES colType, SimpleQuery query, File colIndexShardFile,
                      File dataShardFile, int maxColValueSize, int bytesPerRow) {
@@ -31,56 +33,49 @@ public class CountTask implements Callable<Integer> {
         this.bytesPerRow = bytesPerRow;
 
         this.stringBytes = new byte[maxColValueSize];
+        if (colType == COLUMN_TYPES.INT_TYPE) {
+            this.queryValueAsInt = Integer.parseInt(query.getValue());
+            this.queryValueBytes = null;
+        } else {
+            this.queryValueAsInt = 0;
+            this.queryValueBytes = toFixedStringBytes(query.getValue(), maxColValueSize);
+        }
     }
 
     @Override
     public Integer call() throws Exception {
-        try (FileChannel idxChannel = FileChannel.open(colIndexShardFile.toPath(), StandardOpenOption.READ);
-             FileChannel dataChannel = FileChannel.open(dataShardFile.toPath(), StandardOpenOption.READ)) {
+        try (FileChannel idxChannel = FileChannel.open(colIndexShardFile.toPath(), StandardOpenOption.READ)) {
 
             long idxSize = idxChannel.size();
-            long dataSize = dataChannel.size();
-            if (dataSize == 0) return 0;
+            if (idxSize == 0) return 0;
 
             MappedByteBuffer idxBuffer = idxChannel.map(FileChannel.MapMode.READ_ONLY, 0, idxSize);
-            MappedByteBuffer dataBuffer = dataChannel.map(FileChannel.MapMode.READ_ONLY, 0, dataSize);
 
             int numIndexes = 0;
             int position = 0;
 
             while (position < idxSize) {
+                requireRemaining(idxSize, position, maxColValueSize + 4);
                 idxBuffer.position(position);
 
-                Object colValue;
+                boolean valueMatches;
                 if (colType == COLUMN_TYPES.INT_TYPE) {
-                    colValue = idxBuffer.getInt();
+                    valueMatches = idxBuffer.getInt() == queryValueAsInt;
                 } else {
                     idxBuffer.get(stringBytes, 0, maxColValueSize);
-                    int strLength = 0;
-                    while (strLength < maxColValueSize && stringBytes[strLength] != 0) {
-                        strLength++;
-                    }
-
-                    colValue = new String(stringBytes, 0, strLength, StandardCharsets.UTF_8);
+                    valueMatches = fixedBytesEqual(stringBytes, queryValueBytes);
                 }
 
                 position += maxColValueSize;
                 idxBuffer.position(position);
 
-                if (isColValueEqualToQueryValue(colType, colValue, query.getValue())) {
+                if (valueMatches) {
                     numIndexes = idxBuffer.getInt();
-                    position += 4;
-                    idxBuffer.position(position);
-
-                    byte[][] rows = getRows(idxBuffer, dataBuffer, numIndexes);
-
-                    for (byte[] row : rows) {
-                        parseRowData(row);
-                    }
-
-                    return rows.length;
+                    requireRemaining(idxSize, position + 4, numIndexes * 4);
+                    return numIndexes;
                 } else {
                     int numIndexesToSkip = idxBuffer.getInt();
+                    requireRemaining(idxSize, position + 4, numIndexesToSkip * 4);
                     position += 4 + (numIndexesToSkip * 4);
                 }
             }
@@ -91,12 +86,35 @@ public class CountTask implements Callable<Integer> {
         }
     }
 
-    private boolean isColValueEqualToQueryValue(COLUMN_TYPES colType, Object colValue, String queryValue) {
-        if (colType == COLUMN_TYPES.INT_TYPE) {
-            return (int) colValue == Integer.parseInt(queryValue);
-        } else {
-            return colValue.equals(queryValue);
+    private void requireRemaining(long fileSize, int position, int bytesNeeded) throws IOException {
+        if (bytesNeeded < 0 || fileSize - position < bytesNeeded) {
+            throw new IOException("Malformed index file [" + colIndexShardFile + "]");
         }
+    }
+
+    private byte[] toFixedStringBytes(String value, int numBytes) {
+        byte[] encoded = value.getBytes(StandardCharsets.UTF_8);
+        if (encoded.length > numBytes) {
+            return null;
+        }
+
+        byte[] fixedBytes = new byte[numBytes];
+        System.arraycopy(encoded, 0, fixedBytes, 0, encoded.length);
+        return fixedBytes;
+    }
+
+    private boolean fixedBytesEqual(byte[] left, byte[] right) {
+        if (right == null) {
+            return false;
+        }
+
+        for (int i = 0; i < left.length; i++) {
+            if (left[i] != right[i]) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     public byte[][] getRows(MappedByteBuffer idxBuffer, MappedByteBuffer dataBuffer, int numIndexes) {
